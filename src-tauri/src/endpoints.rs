@@ -30,6 +30,10 @@ use warp::{
     path::{FullPath, Tail},
     Filter, Rejection, Reply,
 };
+use multipart::client::lazy::Multipart;
+use std::io::Read;
+use ureq;
+use mime::Mime;
 
 #[macro_export]
 macro_rules! wechat_api_handler {
@@ -184,6 +188,9 @@ pub struct Image {
         example = 10
     )]
     timeout: u8,
+    /// 上传URL（可选）
+    #[schema(example = "http://example.com/upload")]
+    upload_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -678,12 +685,81 @@ pub async fn save_image(msg: Image, wechat: Arc<Mutex<WeChat>>) -> Result<Json, 
             src: msg.extra.clone(),
             dst: msg.dir.clone(),
         }) {
-            Ok(path) => {
+            Ok(mut path) => {
                 if path.is_empty() {
                     counter += 1;
                     sleep(Duration::from_secs(1));
                     continue;
                 }
+
+                // If upload_url is provided, upload the file
+                if let Some(upload_url) = msg.upload_url {
+                    debug!("开始上传文件到 {}", upload_url);
+
+                    // Create multipart form
+                    let mut buffer = Vec::new();
+                    let mut multipart = Multipart::new();
+
+                    // Read file content
+                    let mut file = match File::open(&path) {
+                        Ok(f) => f,
+                        Err(e) => return handle_error(&format!("打开文件失败: {}", e)),
+                    };
+
+                    if let Err(e) = file.read_to_end(&mut buffer) {
+                        return handle_error(&format!("读取文件失败: {}", e));
+                    }
+
+                    // Add file to form
+                    let content_type: Mime = "image/png".parse().unwrap();
+
+                    multipart.add_stream("file", &buffer[..], Some(&path), Some(content_type));
+
+                    // Prepare multipart data
+                    let prepared = match multipart.prepare() {
+                        Ok(p) => p,
+                        Err(e) => return handle_error(&format!("准备上传数据失败: {}", e)),
+                    };
+
+                    // Send request
+                    match ureq::post(&upload_url)
+                        .set("Content-Type", &format!("multipart/form-data; boundary={}", prepared.boundary()))
+                        .send(prepared)
+                    {
+                        Ok(response) => {
+                            // 获取响应状态码
+                            let status = response.status();
+                            debug!("文件上传成功，状态码: {}", status);
+
+                            // 获取并解析响应体
+                            match response.into_string() {
+                                Ok(response_body) => {
+                                    match serde_json::from_str::<serde_json::Value>(&response_body) {
+                                        Ok(json) => {
+                                            if let Some(result) = json.get("result").and_then(|v| v.as_str()) {
+                                                debug!("上传成功，返回路径: {}", result);
+                                                path = result.to_string();
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("解析响应JSON失败: {}", e);
+                                            return handle_error(&format!("解析响应JSON失败: {}", e));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("读取响应体失败: {}", e);
+                                    return handle_error(&format!("读取响应体失败: {}", e));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("文件上传失败: {}", e);
+                            return handle_error(&format!("文件上传失败: {}", e));
+                        }
+                    }
+                }
+
                 return Ok(warp::reply::json(&ApiResponse {
                     status: 0,
                     error: None,
